@@ -1,0 +1,128 @@
+name: Build
+
+# Ek hi workflow sab zips ke liye. Khud dekhta hai ki shared_app ke andar
+# kaun sa platform folder hai (android / windows / linux) aur sirf wahi banata hai.
+#   shared_app/android  -> APK
+#   shared_app/windows  -> EXE installer (+ portable zip)
+#   shared_app/linux    -> .deb
+# Chalane ke liye: Actions tab -> Build -> Run workflow (ya har push par automatic).
+# Optional variable: CONTROL_API_URL (Settings -> Secrets and variables -> Actions -> Variables)
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CONTROL_API_URL: ${{ vars.CONTROL_API_URL || 'http://localhost:8080' }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      android: ${{ steps.d.outputs.android }}
+      windows: ${{ steps.d.outputs.windows }}
+      linux: ${{ steps.d.outputs.linux }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: d
+        run: |
+          test -f shared_app/pubspec.yaml || { echo "shared_app/pubspec.yaml nahi mili - files repo ke root par honi chahiye (zip nahi, uske andar ki files)"; ls -la; exit 1; }
+          for p in android windows linux; do
+            if [ -d "shared_app/$p" ]; then echo "$p=true" >> "$GITHUB_OUTPUT"; else echo "$p=false" >> "$GITHUB_OUTPUT"; fi
+          done
+
+  apk:
+    needs: detect
+    if: needs.detect.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shared_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Missing gradle files banao
+        run: flutter create --platforms=android --org com.deviceagent --project-name shared_app .
+      - name: Duplicate .kts hatao
+        run: |
+          for f in settings.gradle build.gradle app/build.gradle; do rm -f "android/$f.kts"; done
+          rm -rf android/app/src/main/kotlin/com/example
+      - run: flutter pub get
+      - run: flutter build apk --release --dart-define=CONTROL_API_URL=${{ env.CONTROL_API_URL }}
+      - run: cp build/app/outputs/flutter-apk/app-release.apk UniversalDeviceAgent.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: shared_app/UniversalDeviceAgent.apk
+
+  windows:
+    needs: detect
+    if: needs.detect.outputs.windows == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Missing Windows files banao
+        working-directory: shared_app
+        run: flutter create --platforms=windows --org com.deviceagent --project-name shared_app .
+      - working-directory: shared_app
+        run: flutter pub get
+      - working-directory: shared_app
+        run: flutter build windows --release --dart-define=CONTROL_API_URL=${{ env.CONTROL_API_URL }}
+      - name: Installer (.exe) - Inno Setup
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile installers\windows\vc_redist.x64.exe
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installers\windows\universal_device_agent.iss
+      - name: Portable ZIP
+        shell: pwsh
+        run: Compress-Archive -Path shared_app\build\windows\x64\runner\Release\* -DestinationPath installers\windows\Output\UniversalDeviceAgent-Windows-Portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            installers/windows/Output/*.exe
+            installers/windows/Output/*.zip
+
+  linux:
+    needs: detect
+    if: needs.detect.outputs.linux == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config \
+            libgtk-3-dev libglib2.0-dev libpipewire-0.3-dev \
+            libx11-dev libxtst-dev libturbojpeg0-dev libebook1.2-dev dpkg
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Missing Linux files banao
+        working-directory: shared_app
+        run: flutter create --platforms=linux --org com.deviceagent --project-name shared_app .
+      - working-directory: shared_app
+        run: flutter pub get
+      - working-directory: shared_app
+        run: flutter build linux --release --dart-define=CONTROL_API_URL=${{ env.CONTROL_API_URL }}
+      - name: .deb package banao
+        run: |
+          chmod +x scripts/package_linux_deb.sh
+          scripts/package_linux_deb.sh "0.1.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: dist/*.deb
